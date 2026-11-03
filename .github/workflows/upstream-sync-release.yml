@@ -1,0 +1,187 @@
+name: Sync upstream and release verified build metadata
+
+on:
+  schedule:
+    # GitHub schedules are best-effort and may run later than the requested time.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pokefirered-sync-release-master
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Synchronize pret/pokefirered
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      updated: ${{ steps.state.outputs.updated }}
+      commit: ${{ steps.state.outputs.commit }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Merge upstream without rewriting history
+        id: state
+        shell: bash
+        run: |
+          set -euo pipefail
+          updated=false
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            git remote add upstream https://github.com/pret/pokefirered.git
+            git fetch --no-tags upstream master
+            if git merge-base --is-ancestor upstream/master HEAD; then
+              echo "Upstream is already incorporated."
+            else
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git merge --no-ff --no-edit upstream/master
+              git push origin HEAD:master
+              updated=true
+            fi
+          fi
+          echo "updated=$updated" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Compile and verify FireRed / LeafGreen
+    needs: sync
+    if: github.event_name != 'schedule' || needs.sync.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact synchronized commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit }}
+          persist-credentials: false
+
+      - name: Checkout pret/agbcc
+        uses: actions/checkout@v4
+        with:
+          repository: pret/agbcc
+          path: agbcc
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-arm-none-eabi gcc-arm-none-eabi libpng-dev
+
+      - name: Build and install agbcc
+        working-directory: agbcc
+        run: |
+          ./build.sh
+          ./install.sh ../
+
+      - name: Compile and checksum-verify six original variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          for version in FIRERED LEAFGREEN; do
+            for revision in 0 1 10; do
+              echo "::group::${version} revision ${revision}"
+              make -j"$(nproc)" \
+                GAME_VERSION="$version" GAME_REVISION="$revision" \
+                GAME_LANGUAGE=ENGLISH MODERN=0 COMPARE=1 all syms
+              echo "::endgroup::"
+            done
+          done
+
+      - name: Compile modern GCC variant
+        run: |
+          make -j"$(nproc)" GAME_VERSION=FIRERED GAME_REVISION=0 MODERN=1 COMPARE=0 all
+
+      - name: Package symbols, maps, and verification manifest (no ROM files)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          roms=(poke*.gba)
+          syms=(poke*.sym)
+          maps=(poke*.map)
+          test "${#roms[@]}" -eq 7
+          test "${#syms[@]}" -ge 6
+          test "${#maps[@]}" -ge 7
+          mkdir -p release-out
+          sha256sum "${roms[@]}" > release-out/build-sha256.txt
+          sha1sum "${roms[@]}" > release-out/build-sha1.txt
+          {
+            echo "Repository: ${{ github.repository }}"
+            echo "Commit: ${{ needs.sync.outputs.commit }}"
+            echo "Upstream: https://github.com/pret/pokefirered"
+            echo "Verified: Six original English variants (COMPARE=1)"
+            echo "Additional: FireRed modern GCC build (COMPARE=0)"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            for rom in "${roms[@]}"; do
+              printf '%s %s bytes\n' "$rom" "$(stat -c %s "$rom")"
+            done
+          } > release-out/build-report.txt
+          tar -czf release-out/symbols-and-maps.tar.gz -- "${syms[@]}" "${maps[@]}"
+          echo "Successfully compiled and locally verified ROMs; only non-ROM metadata is packaged."
+
+      - name: Upload publishable metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: pokefirered-build-metadata
+          path: release-out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [sync, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: pokefirered-build-metadata
+          path: release-out
+
+      - name: Publish once per repository commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ needs.sync.outputs.commit }}
+        run: |
+          set -euo pipefail
+          tag="build-${COMMIT_SHA:0:12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; skipping duplicate."
+            exit 0
+          fi
+          cat > release-notes.md <<EOF
+          Automated source verification for commit \`$COMMIT_SHA\`.
+
+          - FireRed and LeafGreen: revision 0, revision 1, and Switch revision 10 were compiled with pret/agbcc and checked against upstream SHA-1 references.
+          - FireRed was also compiled with modern GCC (no matching-ROM comparison).
+          - Assets: symbol tables, linker maps, SHA-1/SHA-256 checksums and a build report.
+          - The complete commercial game ROMs and ELF game images are intentionally **not distributed** here. To produce a ROM from source for your own lawful use, follow [INSTALL.md](https://github.com/969981/pokefirered/blob/master/INSTALL.md).
+          - Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          gh release create "$tag" release-out/* \
+            --target "$COMMIT_SHA" \
+            --title "FireRed / LeafGreen verified build ${COMMIT_SHA:0:12}" \
+            --notes-file release-notes.md \
+            --latest
+          echo "Published $tag."
